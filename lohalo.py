@@ -5,7 +5,7 @@ import math
 
 class LohaloKernelScalingSampler(nn.Module):
     def __init__(self, contrast=3.38589, kernel_radius=2):
-        super(LohaloSampler, self).__init__()
+        super(LohaloKernelScalingSampler, self).__init__()
         self.contrast = contrast
         self.kernel_radius = kernel_radius
         # Pre-calculate constants for Robidoux cubic
@@ -562,7 +562,7 @@ class LohaloKernelScalingSampler(nn.Module):
 
 class LohaloBasicSampler(nn.Module):
     def __init__(self, contrast=3.38589):
-        super(LohaloSampler, self).__init__()
+        super(LohaloBasicSampler, self).__init__()
         self.contrast = contrast
         self.sqrt2 = math.sqrt(2.0)
         self.register_buffer('contrast_tensor', torch.tensor(contrast))
