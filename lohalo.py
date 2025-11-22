@@ -3,9 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-class LohaloSampler(nn.Module):
+class LohaloKernelScalingSampler(nn.Module):
     def __init__(self, contrast=3.38589, kernel_radius=2):
-        super(LohaloSampler, self).__init__()
+        super(LohaloKernelScalingSampler, self).__init__()
         self.contrast = contrast
         self.kernel_radius = kernel_radius
         # Pre-calculate constants for Robidoux cubic
@@ -534,7 +534,7 @@ class LohaloSampler(nn.Module):
         
         # EWA is linear light (no sigmoid)
         ewa_sum = torch.sum(pixels * w_ewa.unsqueeze(1), dim=(-1, -2))
-        ewa_val = ewa_sum / total_weight.squeeze(1)
+        ewa_val = ewa_sum / total_weight.view(B, 1, H_out, W_out)
         
         # --- BLENDING ---
         # beta = (1 - theta) / total_weight if need_ewa else 0
@@ -560,27 +560,219 @@ class LohaloSampler(nn.Module):
         
         return final_val
 
-# Usage Example
-if __name__ == "__main__":
-    # Create sampler
-    sampler = LohaloSampler()
-    
-    # Dummy image: Batch 1, 3 Channels, 100x100
-    img = torch.rand(1, 3, 100, 100)
-    
-    # Create a grid for resampling (e.g., zoom out by 2x)
-    # Output size 50x50
-    H_out, W_out = 50, 50
-    
-    # Generate coordinate grid (pixels)
-    y = torch.linspace(0, 100-1, H_out)
-    x = torch.linspace(0, 100-1, W_out)
-    grid_y, grid_x = torch.meshgrid(y, x, indexing='ij')
-    grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0) # (1, 50, 50, 2)
-    
-    # Run sampler
-    out = sampler(img, grid)
-    
-    print(f"Input shape: {img.shape}")
-    print(f"Output shape: {out.shape}")
-    print("Lohalo sampling complete. Halos destroyed.")
+class LohaloBasicSampler(nn.Module):
+    def __init__(self, contrast=3.38589):
+        super(LohaloBasicSampler, self).__init__()
+        self.contrast = contrast
+        self.sqrt2 = math.sqrt(2.0)
+        self.register_buffer('contrast_tensor', torch.tensor(contrast))
+
+    def inverse_sigmoid(self, q):
+        sig1 = math.tanh(0.5 * self.contrast * 0.5)
+        sig0 = -sig1
+        slope = (1.0/sig1 + sig0) * 0.25 * self.contrast
+        one_over_slope = 1.0 / slope
+        
+        mask_low = (q <= 0.0).float()
+        mask_high = (q >= 1.0).float()
+        mask_mid = 1.0 - mask_low - mask_high
+        
+        res_low = q * one_over_slope
+        res_high = q * one_over_slope + (1.0 - one_over_slope)
+        
+        ssq = (2.0 * sig1) * q + sig0
+        ssq = torch.clamp(ssq, -0.999999, 0.999999)
+        res_mid = (2.0 / self.contrast) * torch.atanh(ssq) + 0.5
+        
+        return res_low * mask_low + res_high * mask_high + res_mid * mask_mid
+
+    def extended_sigmoid(self, q):
+        sig1 = math.tanh(0.5 * self.contrast * 0.5)
+        slope = (1.0/sig1 - sig1) * 0.25 * self.contrast
+        
+        mask_low = (q <= 0.0).float()
+        mask_high = (q >= 1.0).float()
+        mask_mid = 1.0 - mask_low - mask_high
+        
+        slope_times_q = slope * q
+        res_low = slope_times_q
+        res_high = slope_times_q + (1.0 - slope)
+        
+        arg = (0.5 * self.contrast) * q + (-0.25 * self.contrast)
+        res_mid = (0.5 / sig1) * torch.tanh(arg) + 0.5
+        
+        return res_low * mask_low + res_high * mask_high + res_mid * mask_mid
+
+    def robidoux_weight(self, r2):
+        a3 = -3.0
+        a2 = (45739.0 + 7164.0 * self.sqrt2) / 10319.0
+        a0 = (-8926.0 - 14328.0 * self.sqrt2) / 10319.0
+        
+        minus_inner_root = (-103.0 - 36.0 * self.sqrt2) / (7.0 + 72.0 * self.sqrt2)
+        minus_outer_root = -2.0
+        
+        r = torch.sqrt(r2 + 1e-8)
+        
+        mask_inner = (r2 < 1.0).float()
+        mask_outer = ((r2 >= 1.0) & (r2 < 4.0)).float()
+        
+        w_inner = r2 * (a3 * r + a2) + a0
+        w_outer = (r + minus_inner_root) * (r + minus_outer_root)**2
+        
+        return (w_inner * mask_inner + w_outer * mask_outer)
+
+    def mitchell_kernel(self, x):
+        ax = torch.abs(x)
+        mask1 = (ax < 1.0).float()
+        mask2 = ((ax >= 1.0) & (ax < 2.0)).float()
+        
+        v1 = (7.0/6.0)*ax**3 - 2.0*ax**2 + (8.0/9.0)
+        v2 = (-7.0/18.0)*ax**3 + 2.0*ax**2 - (10.0/3.0)*ax + (16.0/9.0)
+        
+        return v1*mask1 + v2*mask2
+
+    def get_jacobian(self, grid):
+        grid_pad_x = F.pad(grid, (0, 0, 1, 1, 0, 0), mode='replicate')
+        dx = (grid_pad_x[:, :, 2:, :] - grid_pad_x[:, :, :-2, :]) * 0.5
+        
+        grid_pad_y = F.pad(grid, (0, 0, 0, 0, 1, 1), mode='replicate')
+        dy = (grid_pad_y[:, 2:, :, :] - grid_pad_y[:, :-2, :, :]) * 0.5
+        
+        J = torch.cat([dx.unsqueeze(-1), dy.unsqueeze(-1)], dim=-1)
+        return J
+
+    def forward(self, image, grid):
+        B, C, H_in, W_in = image.shape
+        B, H_out, W_out, _ = grid.shape
+        
+        J = self.get_jacobian(grid)
+        
+        det = J[..., 0, 0] * J[..., 1, 1] - J[..., 0, 1] * J[..., 1, 0]
+        det = det.unsqueeze(-1).unsqueeze(-1) + 1e-8
+        
+        Jinv = torch.zeros_like(J)
+        Jinv[..., 0, 0] =  J[..., 1, 1]
+        Jinv[..., 0, 1] = -J[..., 0, 1]
+        Jinv[..., 1, 0] = -J[..., 1, 0]
+        Jinv[..., 1, 1] =  J[..., 0, 0]
+        Jinv = Jinv / det
+        
+        a, b = Jinv[..., 0, 0], Jinv[..., 0, 1]
+        c, d = Jinv[..., 1, 0], Jinv[..., 1, 1]
+        
+        n11 = a*a + b*b
+        n12 = a*c + b*d
+        n22 = c*c + d*d
+        
+        frobenius_sq = n11 + n22
+        discriminant = (frobenius_sq**2) - 4.0 * (det.squeeze()**(-2))
+        sqrt_disc = torch.sqrt(torch.clamp(discriminant, min=0.0))
+        
+        twice_s1s1 = frobenius_sq + sqrt_disc
+        s1s1 = 0.5 * twice_s1s1
+        s2s2 = 0.5 * (frobenius_sq - sqrt_disc)
+        
+        major_mag = torch.sqrt(torch.clamp(s1s1, min=1.0))
+        minor_mag = torch.sqrt(torch.clamp(s2s2, min=1.0))
+        
+        diff1 = s1s1 - n11
+        diff2 = s1s1 - n22
+        cond = (diff1**2) >= (diff2**2)
+        
+        temp_u11 = torch.where(cond, n12, diff2)
+        temp_u21 = torch.where(cond, diff1, n12)
+        
+        norm = torch.sqrt(temp_u11**2 + temp_u21**2)
+        u11 = torch.where(norm > 0, temp_u11/norm, torch.ones_like(norm))
+        u21 = torch.where(norm > 0, temp_u21/norm, torch.zeros_like(norm))
+        
+        major_unit_x, major_unit_y = u11, u21
+        minor_unit_x, minor_unit_y = -u21, u11
+        
+        c_major_x = major_unit_x / major_mag
+        c_major_y = major_unit_y / major_mag
+        c_minor_x = minor_unit_x / minor_mag
+        c_minor_y = minor_unit_y / minor_mag
+        
+        ellipse_f = major_mag * minor_mag
+        theta = 1.0 / ellipse_f
+        
+        need_ewa = (twice_s1s1 > 2.0)
+        
+        win_radius = 3
+        win_size = 2 * win_radius
+        
+        ix = torch.floor(grid[..., 0]).long()
+        iy = torch.floor(grid[..., 1]).long()
+        
+        fx = grid[..., 0] - (ix.float() + 0.5)
+        fy = grid[..., 1] - (iy.float() + 0.5)
+        
+        img_pad = F.pad(image, (win_radius, win_radius+1, win_radius, win_radius+1), mode='replicate')
+        
+        oy = torch.arange(-win_radius + 1, win_radius + 1, device=image.device)
+        ox = torch.arange(-win_radius + 1, win_radius + 1, device=image.device)
+        oy, ox = torch.meshgrid(oy, ox, indexing='ij')
+        
+        oy = oy.view(1, 1, 1, win_size, win_size)
+        ox = ox.view(1, 1, 1, win_size, win_size)
+        
+        n_iy = iy.unsqueeze(-1).unsqueeze(-1) + oy + win_radius
+        n_ix = ix.unsqueeze(-1).unsqueeze(-1) + ox + win_radius
+        
+        H_pad, W_pad = img_pad.shape[2], img_pad.shape[3]
+        n_iy = torch.clamp(n_iy, 0, H_pad - 1)
+        n_ix = torch.clamp(n_ix, 0, W_pad - 1)
+        
+        img_flat = img_pad.view(B, C, -1)
+        gather_idx = (n_iy * W_pad + n_ix).view(B, 1, H_out * W_out * win_size * win_size)
+        gather_idx = gather_idx.expand(-1, C, -1)
+        
+        pixels = torch.gather(img_flat, 2, gather_idx)
+        pixels = pixels.view(B, C, H_out, W_out, win_size, win_size)
+        
+        win_offsets_x = ox.view(1, 1, 1, win_size, win_size).float()
+        win_offsets_y = oy.view(1, 1, 1, win_size, win_size).float()
+        
+        rel_x = fx.unsqueeze(-1).unsqueeze(-1) - win_offsets_x
+        rel_y = fy.unsqueeze(-1).unsqueeze(-1) - win_offsets_y
+        
+        pixels_sigmoid = self.inverse_sigmoid(pixels)
+        
+        w_mitchell_x = self.mitchell_kernel(rel_x)
+        w_mitchell_y = self.mitchell_kernel(rel_y)
+        w_mitchell = w_mitchell_x * w_mitchell_y
+        
+        mitchell_sum = torch.sum(pixels_sigmoid * w_mitchell.unsqueeze(1), dim=(-1, -2))
+        mitchell_val = self.extended_sigmoid(mitchell_sum)
+        
+        s = rel_x
+        t = rel_y
+        
+        cmx = c_major_x.unsqueeze(-1).unsqueeze(-1)
+        cmy = c_major_y.unsqueeze(-1).unsqueeze(-1)
+        cnX = c_minor_x.unsqueeze(-1).unsqueeze(-1)
+        cnY = c_minor_y.unsqueeze(-1).unsqueeze(-1)
+        
+        q1 = s * cmx + t * cmy
+        q2 = s * cnX + t * cnY
+        
+        r2 = q1*q1 + q2*q2
+        
+        w_ewa = self.robidoux_weight(r2)
+        
+        total_weight = torch.sum(w_ewa, dim=(-1, -2), keepdim=True) + 1e-8
+        
+        ewa_sum = torch.sum(pixels * w_ewa.unsqueeze(1), dim=(-1, -2))
+        ewa_val = ewa_sum / total_weight.view(B, 1, H_out, W_out)
+        
+        mask_ewa = need_ewa.float().unsqueeze(1)
+        theta_expanded = theta.unsqueeze(1)
+        
+        final_val = torch.where(
+            need_ewa.unsqueeze(1),
+            theta_expanded * mitchell_val + (1.0 - theta_expanded) * ewa_val,
+            mitchell_val
+        )
+        
+        return final_val
