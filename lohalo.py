@@ -534,7 +534,7 @@ class LohaloKernelScalingSampler(nn.Module):
         
         # EWA is linear light (no sigmoid)
         ewa_sum = torch.sum(pixels * w_ewa.unsqueeze(1), dim=(-1, -2))
-        ewa_val = ewa_sum / total_weight.squeeze(1)
+        ewa_val = ewa_sum / total_weight.view(B, 1, H_out, W_out)
         
         # --- BLENDING ---
         # beta = (1 - theta) / total_weight if need_ewa else 0
@@ -764,7 +764,7 @@ class LohaloBasicSampler(nn.Module):
         total_weight = torch.sum(w_ewa, dim=(-1, -2), keepdim=True) + 1e-8
         
         ewa_sum = torch.sum(pixels * w_ewa.unsqueeze(1), dim=(-1, -2))
-        ewa_val = ewa_sum / total_weight.squeeze(1)
+        ewa_val = ewa_sum / total_weight.view(B, 1, H_out, W_out)
         
         mask_ewa = need_ewa.float().unsqueeze(1)
         theta_expanded = theta.unsqueeze(1)
