@@ -3,176 +3,219 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+# --- JIT Compiled Math Kernels for GPU Acceleration ---
+
+@torch.jit.script
+def inverse_sigmoid_jit(q, contrast: float):
+    """
+    JIT-compiled Inverse Sigmoid.
+    """
+    # Note: The C code implements a linear extension beyond 0 and 1.
+    # For GPU efficiency, we approximate or stick to the core range logic
+    # assuming normalized inputs [0,1].
+    
+    # We use torch.tanh/atanh which are GPU optimized
+    sig1 = torch.tanh(torch.tensor(0.5 * contrast * 0.5))
+    sig0 = -sig1
+    
+    # Core inverse logic derived from C:
+    # q = (2/contrast) * atanh( (2*sig1)*p + sig0 ) + 0.5
+    # We need to map q (input p in C terms) back.
+    
+    # Slope calculation for linear extension
+    slope = (1.0/sig1 + sig0) * 0.25 * contrast
+    one_over_slope = 1.0 / slope
+    
+    # Masking for linear extension regions
+    mask_low = (q <= 0.0).float()
+    mask_high = (q >= 1.0).float()
+    mask_mid = 1.0 - mask_low - mask_high
+    
+    # Linear parts
+    res_low = q * one_over_slope
+    res_high = q * one_over_slope + (1.0 - one_over_slope)
+    
+    # Mid part (The actual inverse sigmoid)
+    ssq = (2.0 * sig1) * q + sig0
+    # Clamp ssq to avoid NaNs in atanh due to float precision
+    ssq = torch.clamp(ssq, -0.999999, 0.999999)
+    res_mid = (2.0 / contrast) * torch.atanh(ssq) + 0.5
+    
+    return res_low * mask_low + res_high * mask_high + res_mid * mask_mid
+
+@torch.jit.script
+def extended_sigmoid_jit(q, contrast: float):
+    """
+    JIT-compiled Extended Sigmoid.
+    """
+    sig1 = torch.tanh(torch.tensor(0.5 * contrast * 0.5))
+    slope = (1.0/sig1 - sig1) * 0.25 * contrast
+    
+    mask_low = (q <= 0.0).float()
+    mask_high = (q >= 1.0).float()
+    mask_mid = 1.0 - mask_low - mask_high
+    
+    slope_times_q = slope * q
+    
+    res_low = slope_times_q
+    res_high = slope_times_q + (1.0 - slope)
+    
+    # Mid part
+    # p = (0.5/sig1) * tanh(0.5*contrast*q - 0.25*contrast) + 0.5
+    # Simplified: tanh(0.5*C*q + offset)
+    arg = (0.5 * contrast) * q + (-0.25 * contrast)
+    res_mid = (0.5 / sig1) * torch.tanh(arg) + 0.5
+    
+    return res_low * mask_low + res_high * mask_high + res_mid * mask_mid
+
+@torch.jit.script
+def robidoux_weight_jit(r2, sqrt2: float):
+    """
+    JIT-compiled Robidoux Keys Cubic weight.
+    """
+    # Constants from C code
+    # B = 1656 / (1592 + 597 * sqrt(2))
+    # C_val = 15407 / (35422 + 42984 * sqrt(2))
+    # The C code uses a fast polynomial approximation.
+    
+    # Polynomial coefficients for r < 1 (r2 < 1)
+    # weight = r2 * (a3 * r + a2) + a0
+    a3 = -3.0
+    a2 = (45739.0 + 7164.0 * sqrt2) / 10319.0
+    a0 = (-8926.0 - 14328.0 * sqrt2) / 10319.0
+    
+    # For 1 <= r < 2
+    # weight = (r + minus_inner_root) * (r + minus_outer_root)^2
+    minus_inner_root = (-103.0 - 36.0 * sqrt2) / (7.0 + 72.0 * sqrt2)
+    minus_outer_root = -2.0
+    
+    r = torch.sqrt(r2 + 1e-8)
+    
+    mask_inner = (r2 < 1.0).float()
+    mask_outer = ((r2 >= 1.0) & (r2 < 4.0)).float()
+    
+    w_inner = r2 * (a3 * r + a2) + a0
+    w_outer = (r + minus_inner_root) * (r + minus_outer_root)**2
+    
+    # Normalize factor mentioned in C code: -398/(7+72sqrt(2))
+    # However, since we normalize total weights at the end, constant scaling cancels out.
+    return (w_inner * mask_inner + w_outer * mask_outer)
+
+@torch.jit.script
+def mitchell_kernel_jit(x):
+    """
+    JIT-compiled Mitchell-Netravali kernel.
+    """
+    ax = torch.abs(x)
+    mask1 = (ax < 1.0).float()
+    mask2 = ((ax >= 1.0) & (ax < 2.0)).float()
+    
+    # Region 1
+    v1 = (7.0/6.0)*ax**3 - 2.0*ax**2 + (8.0/9.0)
+    # Region 2
+    v2 = (-7.0/18.0)*ax**3 + 2.0*ax**2 - (10.0/3.0)*ax + (16.0/9.0)
+    
+    return v1*mask1 + v2*mask2
+
+@torch.jit.script
+def calculate_ellipse_jit(J):
+    """
+    JIT-compiled Ellipse Parameter Calculation from Jacobian.
+    """
+    # Inverse Jacobian Jinv
+    # Jinv = inv(J)
+    # For 2x2 matrix [[a, b], [c, d]], inv is 1/det * [[d, -b], [-c, a]]
+    det = J[..., 0, 0] * J[..., 1, 1] - J[..., 0, 1] * J[..., 1, 0]
+    det = det.unsqueeze(-1).unsqueeze(-1) + 1e-8 # Avoid div zero
+    
+    Jinv = torch.zeros_like(J)
+    Jinv[..., 0, 0] =  J[..., 1, 1]
+    Jinv[..., 0, 1] = -J[..., 0, 1]
+    Jinv[..., 1, 0] = -J[..., 1, 0]
+    Jinv[..., 1, 1] =  J[..., 0, 0]
+    Jinv = Jinv / det
+    
+    # Compute N = Jinv * Jinv^T
+    # N11 = a^2 + b^2, N12 = ac + bd, N22 = c^2 + d^2
+    a, b = Jinv[..., 0, 0], Jinv[..., 0, 1]
+    c, d = Jinv[..., 1, 0], Jinv[..., 1, 1]
+    
+    n11 = a*a + b*b
+    n12 = a*c + b*d
+    n22 = c*c + d*d
+    
+    frobenius_sq = n11 + n22
+    discriminant = (frobenius_sq**2) - 4.0 * (det.squeeze()**(-2)) # det(Jinv)^2 = 1/det(J)^2
+    # Safe sqrt
+    sqrt_disc = torch.sqrt(torch.clamp(discriminant, min=0.0))
+    
+    twice_s1s1 = frobenius_sq + sqrt_disc
+    s1s1 = 0.5 * twice_s1s1
+    s2s2 = 0.5 * (frobenius_sq - sqrt_disc)
+    
+    # Clamping singular values (s1, s2 are singular values of Jinv)
+    # s1 = 1/sigma_min(J). If s1 <= 1, sigma_min(J) >= 1 (upsampling).
+    
+    # Ellipse parameters
+    # We need major/minor axes of the ellipse in INPUT space.
+    # If s1s1 <= 1, we clamp to 1.
+    major_mag = torch.sqrt(torch.clamp(s1s1, min=1.0))
+    minor_mag = torch.sqrt(torch.clamp(s2s2, min=1.0))
+    
+    # Eigenvector calculation for rotation
+    # n - s1^2 I
+    t11 = n11 - s1s1
+    t22 = n22 - s1s1
+    
+    # Choose row with largest norm
+    # use_row1 = (t11*t11 + n12*n12) >= (n12*n12 + t22*t22)
+    
+    # Let's stick to C code logic:
+    # temp_u11 = (s1s1-n11)^2 >= (s1s1-n22)^2 ? n12 : s1s1-n22
+    # temp_u21 = ... ? s1s1-n11 : n21
+    
+    diff1 = s1s1 - n11
+    diff2 = s1s1 - n22
+    cond = (diff1**2) >= (diff2**2)
+    
+    temp_u11 = torch.where(cond, n12, diff2)
+    temp_u21 = torch.where(cond, diff1, n12)
+    
+    norm = torch.sqrt(temp_u11**2 + temp_u21**2)
+    u11 = torch.where(norm > 0, temp_u11/norm, torch.ones_like(norm))
+    u21 = torch.where(norm > 0, temp_u21/norm, torch.zeros_like(norm))
+    
+    # Major/Minor unit vectors
+    major_unit_x, major_unit_y = u11, u21
+    minor_unit_x, minor_unit_y = -u21, u11
+    
+    # Ellipse coefficients for distance calc
+    # c_major = unit / mag
+    c_major_x = major_unit_x / major_mag
+    c_major_y = major_unit_y / major_mag
+    c_minor_x = minor_unit_x / minor_mag
+    c_minor_y = minor_unit_y / minor_mag
+    
+    # Ellipse area factor for blending
+    ellipse_f = major_mag * minor_mag
+    theta = 1.0 / ellipse_f
+    
+    # Decision: Do we need EWA?
+    # If twice_s1s1 <= 2.0, it's pure upsampling (or 1:1).
+    need_ewa = (twice_s1s1 > 2.0)
+    
+    return c_major_x, c_major_y, c_minor_x, c_minor_y, theta, need_ewa
+
 class LohaloKernelScalingSampler(nn.Module):
     def __init__(self, contrast=3.38589, kernel_radius=2):
         super(LohaloKernelScalingSampler, self).__init__()
-        self.contrast = contrast
+        self.contrast = float(contrast)
         self.kernel_radius = kernel_radius
         # Pre-calculate constants for Robidoux cubic
-        self.sqrt2 = math.sqrt(2.0)
+        self.sqrt2 = float(math.sqrt(2.0))
         self.register_buffer('contrast_tensor', torch.tensor(contrast))
 
-    def sigmoid_function(self, p):
-        """
-        Sigmoidization: Resampling through a colorspace where gamut extremes 
-        are far from midtones to minimize over/undershoots.
-        """
-        return torch.tanh(0.5 * self.contrast * (p - 0.5))
-
-    def inverse_sigmoid(self, q):
-        """
-        Inverse of the extended sigmoidal function.
-        Maps the sigmoidized values back to linear light.
-        """
-        # Note: The C code implements a linear extension beyond 0 and 1.
-        # For GPU efficiency, we approximate or stick to the core range logic
-        # assuming normalized inputs [0,1].
-        
-        sig1 = math.tanh(0.5 * self.contrast * 0.5)
-        sig0 = -sig1
-        
-        # Core inverse logic derived from C:
-        # q = (2/contrast) * atanh( (2*sig1)*p + sig0 ) + 0.5
-        # We need to map q (input p in C terms) back.
-        
-        # Let's follow the C logic for 'inverse_sigmoidal' which takes linear p -> curved q
-        # Wait, C code naming is tricky. 
-        # C: inverse_sigmoidal(p) takes linear pixel p and returns curved value.
-        # C: extended_sigmoidal(q) takes curved value q and returns linear pixel.
-        
-        # Slope calculation for linear extension
-        slope = (1.0/sig1 + sig0) * 0.25 * self.contrast
-        one_over_slope = 1.0 / slope
-        
-        # Masking for linear extension regions
-        mask_low = (q <= 0.0).float()
-        mask_high = (q >= 1.0).float()
-        mask_mid = 1.0 - mask_low - mask_high
-        
-        # Linear parts
-        res_low = q * one_over_slope
-        res_high = q * one_over_slope + (1.0 - one_over_slope)
-        
-        # Mid part (The actual inverse sigmoid)
-        ssq = (2.0 * sig1) * q + sig0
-        # Clamp ssq to avoid NaNs in atanh due to float precision
-        ssq = torch.clamp(ssq, -0.999999, 0.999999)
-        res_mid = (2.0 / self.contrast) * torch.atanh(ssq) + 0.5
-        
-        return res_low * mask_low + res_high * mask_high + res_mid * mask_mid
-
-    def extended_sigmoid(self, q):
-        """
-        Maps curved value q back to linear pixel value p.
-        """
-        sig1 = math.tanh(0.5 * self.contrast * 0.5)
-        slope = (1.0/sig1 - sig1) * 0.25 * self.contrast
-        
-        mask_low = (q <= 0.0).float()
-        mask_high = (q >= 1.0).float()
-        mask_mid = 1.0 - mask_low - mask_high
-        
-        slope_times_q = slope * q
-        
-        res_low = slope_times_q
-        res_high = slope_times_q + (1.0 - slope)
-        
-        # Mid part
-        # p = (0.5/sig1) * tanh(0.5*contrast*q - 0.25*contrast) + 0.5
-        # Simplified: tanh(0.5*C*q + offset)
-        arg = (0.5 * self.contrast) * q + (-0.25 * self.contrast)
-        res_mid = (0.5 / sig1) * torch.tanh(arg) + 0.5
-        
-        return res_low * mask_low + res_high * mask_high + res_mid * mask_mid
-
-    def robidoux_weight(self, r2):
-        """
-        Computes the Robidoux Keys Cubic weight for EWA.
-        r2 is squared distance.
-        """
-        # Constants from C code
-        # B = 1656 / (1592 + 597 * sqrt(2))
-        # C_val = 15407 / (35422 + 42984 * sqrt(2))
-        # The C code uses a fast polynomial approximation.
-        
-        # Polynomial coefficients for r < 1 (r2 < 1)
-        # weight = r2 * (a3 * r + a2) + a0
-        a3 = -3.0
-        a2 = (45739.0 + 7164.0 * self.sqrt2) / 10319.0
-        a0 = (-8926.0 - 14328.0 * self.sqrt2) / 10319.0
-        
-        # For 1 <= r < 2
-        # weight = (r + minus_inner_root) * (r + minus_outer_root)^2
-        minus_inner_root = (-103.0 - 36.0 * self.sqrt2) / (7.0 + 72.0 * self.sqrt2)
-        minus_outer_root = -2.0
-        
-        r = torch.sqrt(r2 + 1e-8)
-        
-        mask_inner = (r2 < 1.0).float()
-        mask_outer = ((r2 >= 1.0) & (r2 < 4.0)).float()
-        
-        w_inner = r2 * (a3 * r + a2) + a0
-        w_outer = (r + minus_inner_root) * (r + minus_outer_root)**2
-        
-        # Normalize factor mentioned in C code: -398/(7+72sqrt(2))
-        # However, since we normalize total weights at the end, constant scaling cancels out.
-        return (w_inner * mask_inner + w_outer * mask_outer)
-
-    def mitchell_weights(self, x):
-        """
-        Computes 1D Mitchell-Netravali weights for 4 points: -1, 0, 1, 2
-        relative to x in [0, 1].
-        Using the fast 13-flop method from Robidoux.
-        """
-        ax = torch.abs(x)
-        
-        # 7/18 * ax
-        xt1 = (7.0/18.0) * ax
-        xt2 = 1.0 - ax
-        
-        # (xt1 - 1/3) * ax * ax
-        fou = (xt1 - (1.0/3.0)) * ax * ax
-        
-        # (1/18 - xt1) * xt2 * xt2
-        one = ((1.0/18.0) - xt1) * xt2 * xt2
-        
-        xt3 = fou - one
-        
-        # Weights
-        # thr = ax - fou - xt3
-        thr = ax - fou - xt3
-        # two = xt2 - one + xt3
-        two = xt2 - one + xt3
-        
-        # Re-ordering to match offsets -1, 0, 1, 2
-        # The C code calculates weights for positions relative to anchor.
-        # uno corresponds to -1, dos to 0, tre to 1, qua to 2.
-        
-        # Wait, let's map C variables to standard 4-point spline indices:
-        # uno -> weight for pixel at -1
-        # dos -> weight for pixel at 0
-        # tre -> weight for pixel at 1
-        # qua -> weight for pixel at 2
-        
-        # In C:
-        # uno = (1/18 - yt1)*yt2^2 ... wait, that's Y.
-        # Let's look at the X calc:
-        # one = (1/18 - xt1)*xt2^2
-        # fou = (xt1 - 1/3)*ax^2
-        # xt3 = fou - one
-        # thr = ax - fou - xt3
-        # two = xt2 - one + xt3
-        
-        # The C code combines these into 'uno', 'dos', 'tre', 'qua' using tensor products.
-        # Here we return the 4 weights for the 1D kernel.
-        # w_minus_1 = one
-        # w_0 = two
-        # w_1 = thr
-        # w_2 = fou
-        
-        return one, two, thr, fou
-
-    def get_jacobian(self, grid, height, width):
+    def get_jacobian(self, grid, height: int, width: int):
         """
         Computes the Jacobian of the grid transformation using finite differences.
         Grid is (B, H, W, 2) in pixel coordinates.
@@ -228,90 +271,8 @@ class LohaloKernelScalingSampler(nn.Module):
         # 1. Jacobian Analysis & Ellipse Parameters
         J = self.get_jacobian(grid, H_out, W_out)
         
-        # Inverse Jacobian Jinv
-        # Jinv = inv(J)
-        # For 2x2 matrix [[a, b], [c, d]], inv is 1/det * [[d, -b], [-c, a]]
-        det = J[..., 0, 0] * J[..., 1, 1] - J[..., 0, 1] * J[..., 1, 0]
-        det = det.unsqueeze(-1).unsqueeze(-1) + 1e-8 # Avoid div zero
-        
-        Jinv = torch.zeros_like(J)
-        Jinv[..., 0, 0] =  J[..., 1, 1]
-        Jinv[..., 0, 1] = -J[..., 0, 1]
-        Jinv[..., 1, 0] = -J[..., 1, 0]
-        Jinv[..., 1, 1] =  J[..., 0, 0]
-        Jinv = Jinv / det
-        
-        # Compute N = Jinv * Jinv^T
-        # N11 = a^2 + b^2, N12 = ac + bd, N22 = c^2 + d^2
-        a, b = Jinv[..., 0, 0], Jinv[..., 0, 1]
-        c, d = Jinv[..., 1, 0], Jinv[..., 1, 1]
-        
-        n11 = a*a + b*b
-        n12 = a*c + b*d
-        n22 = c*c + d*d
-        
-        frobenius_sq = n11 + n22
-        discriminant = (frobenius_sq**2) - 4.0 * (det.squeeze()**(-2)) # det(Jinv)^2 = 1/det(J)^2
-        # Safe sqrt
-        sqrt_disc = torch.sqrt(torch.clamp(discriminant, min=0.0))
-        
-        twice_s1s1 = frobenius_sq + sqrt_disc
-        s1s1 = 0.5 * twice_s1s1
-        s2s2 = 0.5 * (frobenius_sq - sqrt_disc)
-        
-        # Clamping singular values (s1, s2 are singular values of Jinv)
-        # s1 = 1/sigma_min(J). If s1 <= 1, sigma_min(J) >= 1 (upsampling).
-        
-        # Ellipse parameters
-        # We need major/minor axes of the ellipse in INPUT space.
-        # If s1s1 <= 1, we clamp to 1.
-        major_mag = torch.sqrt(torch.clamp(s1s1, min=1.0))
-        minor_mag = torch.sqrt(torch.clamp(s2s2, min=1.0))
-        
-        # Eigenvector calculation for rotation
-        # n - s1^2 I
-        t11 = n11 - s1s1
-        t22 = n22 - s1s1
-        
-        # Choose row with largest norm
-        use_row1 = (t11*t11 + n12*n12) >= (n12*n12 + t22*t22)
-        
-        u1 = torch.where(use_row1, -n12, t22) # y component
-        u2 = torch.where(use_row1, t11, -n12) # x component ... wait, eigenvector logic is tricky.
-        
-        # Let's stick to C code logic:
-        # temp_u11 = (s1s1-n11)^2 >= (s1s1-n22)^2 ? n12 : s1s1-n22
-        # temp_u21 = ... ? s1s1-n11 : n21
-        
-        diff1 = s1s1 - n11
-        diff2 = s1s1 - n22
-        cond = (diff1**2) >= (diff2**2)
-        
-        temp_u11 = torch.where(cond, n12, diff2)
-        temp_u21 = torch.where(cond, diff1, n12)
-        
-        norm = torch.sqrt(temp_u11**2 + temp_u21**2)
-        u11 = torch.where(norm > 0, temp_u11/norm, torch.ones_like(norm))
-        u21 = torch.where(norm > 0, temp_u21/norm, torch.zeros_like(norm))
-        
-        # Major/Minor unit vectors
-        major_unit_x, major_unit_y = u11, u21
-        minor_unit_x, minor_unit_y = -u21, u11
-        
-        # Ellipse coefficients for distance calc
-        # c_major = unit / mag
-        c_major_x = major_unit_x / major_mag
-        c_major_y = major_unit_y / major_mag
-        c_minor_x = minor_unit_x / minor_mag
-        c_minor_y = minor_unit_y / minor_mag
-        
-        # Ellipse area factor for blending
-        ellipse_f = major_mag * minor_mag
-        theta = 1.0 / ellipse_f
-        
-        # Decision: Do we need EWA?
-        # If twice_s1s1 <= 2.0, it's pure upsampling (or 1:1).
-        need_ewa = (twice_s1s1 > 2.0)
+        # Use JIT compiled ellipse calculation
+        c_major_x, c_major_y, c_minor_x, c_minor_y, theta, need_ewa = calculate_ellipse_jit(J)
         
         # --- DATA GATHERING ---
         # We need a window of pixels around each grid point.
@@ -409,7 +370,7 @@ class LohaloKernelScalingSampler(nn.Module):
         # We'll apply to all for simplicity, or split if C=4.
         # C code applies inverse_sigmoidal to input, sums, then extended_sigmoidal.
         
-        pixels_sigmoid = self.inverse_sigmoid(pixels)
+        pixels_sigmoid = inverse_sigmoid_jit(pixels, self.contrast)
         
         # Mitchell weights are separable.
         # We only need the 4x4 block centered on the target.
@@ -436,9 +397,6 @@ class LohaloKernelScalingSampler(nn.Module):
         # The formula assumes ax in [0, 1].
         ax = torch.abs(fx)
         ay = torch.abs(fy)
-        
-        wx_1, wx_2, wx_3, wx_4 = self.mitchell_weights(ax)
-        wy_1, wy_2, wy_3, wy_4 = self.mitchell_weights(ay)
         
         # Map these weights to the window indices
         # If shift_x (fx>=0): weights correspond to offsets -1, 0, 1, 2.
@@ -473,20 +431,9 @@ class LohaloKernelScalingSampler(nn.Module):
         # else 0
         # This is mathematically equivalent to the fast weights.
         
-        def mitchell_kernel(x):
-            ax = torch.abs(x)
-            mask1 = (ax < 1.0).float()
-            mask2 = ((ax >= 1.0) & (ax < 2.0)).float()
-            
-            # Region 1
-            v1 = (7.0/6.0)*ax**3 - 2.0*ax**2 + (8.0/9.0)
-            # Region 2
-            v2 = (-7.0/18.0)*ax**3 + 2.0*ax**2 - (10.0/3.0)*ax + (16.0/9.0)
-            
-            return v1*mask1 + v2*mask2
-            
-        w_mitchell_x = mitchell_kernel(rel_x) # (B, H, W, 6, 6)
-        w_mitchell_y = mitchell_kernel(rel_y)
+        # Use JIT compiled Mitchell kernel
+        w_mitchell_x = mitchell_kernel_jit(rel_x) # (B, H, W, 6, 6)
+        w_mitchell_y = mitchell_kernel_jit(rel_y)
         
         # Tensor product weights
         # rel_x varies along last dim (columns), rel_y along second to last (rows)
@@ -498,7 +445,7 @@ class LohaloKernelScalingSampler(nn.Module):
         mitchell_sum = torch.sum(pixels_sigmoid * w_mitchell.unsqueeze(1), dim=(-1, -2))
         
         # Desigmoidize
-        mitchell_val = self.extended_sigmoid(mitchell_sum)
+        mitchell_val = extended_sigmoid_jit(mitchell_sum, self.contrast)
         
         # Handle Alpha (last channel) separately if needed (C code does linear for alpha)
         # For simplicity here, we treat all channels same, or user can split.
@@ -527,13 +474,18 @@ class LohaloKernelScalingSampler(nn.Module):
         
         r2 = q1*q1 + q2*q2
         
-        w_ewa = self.robidoux_weight(r2)
+        w_ewa = robidoux_weight_jit(r2, self.sqrt2)
         
         # Normalize EWA weights
         total_weight = torch.sum(w_ewa, dim=(-1, -2), keepdim=True) + 1e-8
         
         # EWA is linear light (no sigmoid)
         ewa_sum = torch.sum(pixels * w_ewa.unsqueeze(1), dim=(-1, -2))
+        
+        # FIX: Correct broadcasting for division
+        # total_weight shape is (B, H, W, 1, 1)
+        # ewa_sum shape is (B, C, H, W)
+        # We need total_weight to be (B, 1, H, W)
         ewa_val = ewa_sum / total_weight.view(B, 1, H_out, W_out)
         
         # --- BLENDING ---
@@ -563,73 +515,9 @@ class LohaloKernelScalingSampler(nn.Module):
 class LohaloBasicSampler(nn.Module):
     def __init__(self, contrast=3.38589):
         super(LohaloBasicSampler, self).__init__()
-        self.contrast = contrast
-        self.sqrt2 = math.sqrt(2.0)
+        self.contrast = float(contrast)
+        self.sqrt2 = float(math.sqrt(2.0))
         self.register_buffer('contrast_tensor', torch.tensor(contrast))
-
-    def inverse_sigmoid(self, q):
-        sig1 = math.tanh(0.5 * self.contrast * 0.5)
-        sig0 = -sig1
-        slope = (1.0/sig1 + sig0) * 0.25 * self.contrast
-        one_over_slope = 1.0 / slope
-        
-        mask_low = (q <= 0.0).float()
-        mask_high = (q >= 1.0).float()
-        mask_mid = 1.0 - mask_low - mask_high
-        
-        res_low = q * one_over_slope
-        res_high = q * one_over_slope + (1.0 - one_over_slope)
-        
-        ssq = (2.0 * sig1) * q + sig0
-        ssq = torch.clamp(ssq, -0.999999, 0.999999)
-        res_mid = (2.0 / self.contrast) * torch.atanh(ssq) + 0.5
-        
-        return res_low * mask_low + res_high * mask_high + res_mid * mask_mid
-
-    def extended_sigmoid(self, q):
-        sig1 = math.tanh(0.5 * self.contrast * 0.5)
-        slope = (1.0/sig1 - sig1) * 0.25 * self.contrast
-        
-        mask_low = (q <= 0.0).float()
-        mask_high = (q >= 1.0).float()
-        mask_mid = 1.0 - mask_low - mask_high
-        
-        slope_times_q = slope * q
-        res_low = slope_times_q
-        res_high = slope_times_q + (1.0 - slope)
-        
-        arg = (0.5 * self.contrast) * q + (-0.25 * self.contrast)
-        res_mid = (0.5 / sig1) * torch.tanh(arg) + 0.5
-        
-        return res_low * mask_low + res_high * mask_high + res_mid * mask_mid
-
-    def robidoux_weight(self, r2):
-        a3 = -3.0
-        a2 = (45739.0 + 7164.0 * self.sqrt2) / 10319.0
-        a0 = (-8926.0 - 14328.0 * self.sqrt2) / 10319.0
-        
-        minus_inner_root = (-103.0 - 36.0 * self.sqrt2) / (7.0 + 72.0 * self.sqrt2)
-        minus_outer_root = -2.0
-        
-        r = torch.sqrt(r2 + 1e-8)
-        
-        mask_inner = (r2 < 1.0).float()
-        mask_outer = ((r2 >= 1.0) & (r2 < 4.0)).float()
-        
-        w_inner = r2 * (a3 * r + a2) + a0
-        w_outer = (r + minus_inner_root) * (r + minus_outer_root)**2
-        
-        return (w_inner * mask_inner + w_outer * mask_outer)
-
-    def mitchell_kernel(self, x):
-        ax = torch.abs(x)
-        mask1 = (ax < 1.0).float()
-        mask2 = ((ax >= 1.0) & (ax < 2.0)).float()
-        
-        v1 = (7.0/6.0)*ax**3 - 2.0*ax**2 + (8.0/9.0)
-        v2 = (-7.0/18.0)*ax**3 + 2.0*ax**2 - (10.0/3.0)*ax + (16.0/9.0)
-        
-        return v1*mask1 + v2*mask2
 
     def get_jacobian(self, grid):
         grid_pad_x = F.pad(grid, (0, 0, 1, 1, 0, 0), mode='replicate')
@@ -647,57 +535,8 @@ class LohaloBasicSampler(nn.Module):
         
         J = self.get_jacobian(grid)
         
-        det = J[..., 0, 0] * J[..., 1, 1] - J[..., 0, 1] * J[..., 1, 0]
-        det = det.unsqueeze(-1).unsqueeze(-1) + 1e-8
-        
-        Jinv = torch.zeros_like(J)
-        Jinv[..., 0, 0] =  J[..., 1, 1]
-        Jinv[..., 0, 1] = -J[..., 0, 1]
-        Jinv[..., 1, 0] = -J[..., 1, 0]
-        Jinv[..., 1, 1] =  J[..., 0, 0]
-        Jinv = Jinv / det
-        
-        a, b = Jinv[..., 0, 0], Jinv[..., 0, 1]
-        c, d = Jinv[..., 1, 0], Jinv[..., 1, 1]
-        
-        n11 = a*a + b*b
-        n12 = a*c + b*d
-        n22 = c*c + d*d
-        
-        frobenius_sq = n11 + n22
-        discriminant = (frobenius_sq**2) - 4.0 * (det.squeeze()**(-2))
-        sqrt_disc = torch.sqrt(torch.clamp(discriminant, min=0.0))
-        
-        twice_s1s1 = frobenius_sq + sqrt_disc
-        s1s1 = 0.5 * twice_s1s1
-        s2s2 = 0.5 * (frobenius_sq - sqrt_disc)
-        
-        major_mag = torch.sqrt(torch.clamp(s1s1, min=1.0))
-        minor_mag = torch.sqrt(torch.clamp(s2s2, min=1.0))
-        
-        diff1 = s1s1 - n11
-        diff2 = s1s1 - n22
-        cond = (diff1**2) >= (diff2**2)
-        
-        temp_u11 = torch.where(cond, n12, diff2)
-        temp_u21 = torch.where(cond, diff1, n12)
-        
-        norm = torch.sqrt(temp_u11**2 + temp_u21**2)
-        u11 = torch.where(norm > 0, temp_u11/norm, torch.ones_like(norm))
-        u21 = torch.where(norm > 0, temp_u21/norm, torch.zeros_like(norm))
-        
-        major_unit_x, major_unit_y = u11, u21
-        minor_unit_x, minor_unit_y = -u21, u11
-        
-        c_major_x = major_unit_x / major_mag
-        c_major_y = major_unit_y / major_mag
-        c_minor_x = minor_unit_x / minor_mag
-        c_minor_y = minor_unit_y / minor_mag
-        
-        ellipse_f = major_mag * minor_mag
-        theta = 1.0 / ellipse_f
-        
-        need_ewa = (twice_s1s1 > 2.0)
+        # Reuse JIT compiled ellipse calculation
+        c_major_x, c_major_y, c_minor_x, c_minor_y, theta, need_ewa = calculate_ellipse_jit(J)
         
         win_radius = 3
         win_size = 2 * win_radius
@@ -737,14 +576,14 @@ class LohaloBasicSampler(nn.Module):
         rel_x = fx.unsqueeze(-1).unsqueeze(-1) - win_offsets_x
         rel_y = fy.unsqueeze(-1).unsqueeze(-1) - win_offsets_y
         
-        pixels_sigmoid = self.inverse_sigmoid(pixels)
+        pixels_sigmoid = inverse_sigmoid_jit(pixels, self.contrast)
         
-        w_mitchell_x = self.mitchell_kernel(rel_x)
-        w_mitchell_y = self.mitchell_kernel(rel_y)
+        w_mitchell_x = mitchell_kernel_jit(rel_x)
+        w_mitchell_y = mitchell_kernel_jit(rel_y)
         w_mitchell = w_mitchell_x * w_mitchell_y
         
         mitchell_sum = torch.sum(pixels_sigmoid * w_mitchell.unsqueeze(1), dim=(-1, -2))
-        mitchell_val = self.extended_sigmoid(mitchell_sum)
+        mitchell_val = extended_sigmoid_jit(mitchell_sum, self.contrast)
         
         s = rel_x
         t = rel_y
@@ -759,11 +598,16 @@ class LohaloBasicSampler(nn.Module):
         
         r2 = q1*q1 + q2*q2
         
-        w_ewa = self.robidoux_weight(r2)
+        w_ewa = robidoux_weight_jit(r2, self.sqrt2)
         
         total_weight = torch.sum(w_ewa, dim=(-1, -2), keepdim=True) + 1e-8
         
         ewa_sum = torch.sum(pixels * w_ewa.unsqueeze(1), dim=(-1, -2))
+        
+        # FIX: Correct broadcasting for division
+        # total_weight shape is (B, H, W, 1, 1)
+        # ewa_sum shape is (B, C, H, W)
+        # We need total_weight to be (B, 1, H, W)
         ewa_val = ewa_sum / total_weight.view(B, 1, H_out, W_out)
         
         mask_ewa = need_ewa.float().unsqueeze(1)
